@@ -31,6 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
+#include <poll.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -41,6 +43,12 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
+#include <sys/event.h>
+#ifdef VERBOSE
+#define PRINTF printf
+#else
+#define PRINTF(...)
+#endif
 
 static struct {
 	EGLDisplay display;
@@ -465,6 +473,7 @@ static int init_gl(void)
 
 static void draw(uint32_t i)
 {
+	PRINTF("draw(%d)\n", i);
 	ESMatrix modelview;
 
 	/* clear the color buffer */
@@ -554,8 +563,32 @@ static struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 static void page_flip_handler(int fd, unsigned int frame,
 		  unsigned int sec, unsigned int usec, void *data)
 {
+	PRINTF("page_flip_handler(fd=%d, frame=%d, sec=%d, usec=%d data=%p) ",
+	       fd, frame, sec, usec, data);
 	int *waiting_for_flip = data;
+	PRINTF("waiting_for_flip=%d\n", *waiting_for_flip);
 	*waiting_for_flip = 0;
+}
+
+static void
+kevent_init(struct kevent *ke, int *kqp)
+{
+	int kq;
+
+	kq = kqueue();
+
+	if (kq == -1) {
+		printf("kqueue() error\n");
+		exit(EXIT_FAILURE);
+	}
+	memset(ke, 0, sizeof(struct kevent));
+	EV_SET(ke, drm.fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 5, NULL);
+
+	if (kevent(kq, ke, 1, NULL, 0, NULL) == -1) {
+		printf("kevent() error\n");
+		exit(EXIT_FAILURE);
+	}
+	*kqp = kq;
 }
 
 int main(int argc, char *argv[])
@@ -576,6 +609,17 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
+	struct kevent ke;
+	int kq, ch, use_kevent = 0;
+	while ((ch = getopt(argc, argv, "k")) != -1)  {
+		switch (ch) {
+		case 'k':
+			use_kevent =1;
+			break;
+		}
+	}
+	if (use_kevent)
+		kevent_init(&ke, &kq);
 	FD_ZERO(&fds);
 	FD_SET(0, &fds);
 	FD_SET(drm.fd, &fds);
@@ -630,6 +674,27 @@ int main(int argc, char *argv[])
 		}
 
 		while (waiting_for_flip) {
+			PRINTF("%s: waiting for flip event on drm fd\n",__func__);
+
+			/* gettimeofday(&tv, NULL); */
+			/* printf("Called select/poll at time = %ld ms\n", tv.tv_usec/1000); */
+			if (use_kevent) {
+				memset(&ke, 0, sizeof(ke));
+				/* receive an event, a blocking call as timeout is NULL */
+				ret = kevent(kq, NULL, 0, &ke, 1, NULL);
+				if (ret == -1) {
+					printf("kevent() error\n");
+					exit(EXIT_FAILURE);
+				} else if (ret == 0)
+					printf("kevent() timeout...\n");
+
+				if (ke.ident != drm.fd) {
+					printf("ke.ident mismatch\n");
+					exit(EXIT_FAILURE);
+				}
+				drmHandleEvent(drm.fd, &evctx);
+				continue;
+			}
 			ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
 			if (ret < 0) {
 				printf("select err: %s\n", strerror(errno));
