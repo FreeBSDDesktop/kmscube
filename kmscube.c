@@ -81,7 +81,7 @@ struct drm_fb {
 static int init_drm(void)
 {
 	static const char *modules[] = {
-			"i915", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos", "msm", "tegra"
+		        "i915", "amdgpu", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos", "msm", "tegra", "virtio_gpu"
 	};
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
@@ -129,9 +129,14 @@ static int init_drm(void)
 		return -1;
 	}
 
-	/* find highest resolution mode: */
+	/* find prefered mode or the highest resolution mode: */
 	for (i = 0, area = 0; i < connector->count_modes; i++) {
 		drmModeModeInfo *current_mode = &connector->modes[i];
+
+		if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
+			drm.mode = current_mode;
+		}
+
 		int current_area = current_mode->hdisplay * current_mode->vdisplay;
 		if (current_area > area) {
 			drm.mode = current_mode;
