@@ -1,13 +1,20 @@
 #! /bin/sh
 
-srcdir=`dirname $0`
+srcdir=`dirname "$0"`
 test -z "$srcdir" && srcdir=.
 
 ORIGDIR=`pwd`
-cd $srcdir
+cd "$srcdir"
 
-mkdir -p m4
-autoreconf -v --install || exit 1
-cd $ORIGDIR || exit $?
+git config --local --get format.subjectPrefix >/dev/null ||
+    git config --local format.subjectPrefix "PATCH kmscube" 2>/dev/null
 
-$srcdir/configure --enable-maintainer-mode "$@"
+git config --local --get sendemail.to >/dev/null ||
+    git config --local sendemail.to "mesa-dev@lists.freedesktop.org" 2>/dev/null
+
+autoreconf --force --verbose --install || exit 1
+cd "$ORIGDIR" || exit $?
+
+if test -z "$NOCONFIGURE"; then
+    exec "$srcdir"/configure "$@"
+fi

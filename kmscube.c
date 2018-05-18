@@ -24,700 +24,134 @@
 
 /* Based on a egl cube test app originally written by Arvin Schnell */
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <time.h>
-#include <poll.h>
+#include <getopt.h>
 
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-#include <gbm.h>
+#include "common.h"
+#include "drm-common.h"
 
-#include "esUtil.h"
-
+#ifdef HAVE_GST
+#include <gst/gst.h>
+GST_DEBUG_CATEGORY(kmscube_debug);
+#endif
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#include <sys/event.h>
-#ifdef VERBOSE
-#define PRINTF printf
-#else
-#define PRINTF(...)
-#endif
+static const struct egl *egl;
+static const struct gbm *gbm;
+static const struct drm *drm;
 
-static struct {
-	EGLDisplay display;
-	EGLConfig config;
-	EGLContext context;
-	EGLSurface surface;
-	GLuint program;
-	GLint modelviewmatrix, modelviewprojectionmatrix, normalmatrix;
-	GLuint vbo;
-	GLuint positionsoffset, colorsoffset, normalsoffset;
-} gl;
+static const char *shortopts = "AD:M:m:V:";
 
-static struct {
-	struct gbm_device *dev;
-	struct gbm_surface *surface;
-} gbm;
-
-static struct {
-	int fd;
-	drmModeModeInfo *mode;
-	uint32_t crtc_id;
-	uint32_t connector_id;
-} drm;
-
-struct drm_fb {
-	struct gbm_bo *bo;
-	uint32_t fb_id;
+static const struct option longopts[] = {
+	{"atomic", no_argument,       0, 'A'},
+	{"device", required_argument, 0, 'D'},
+	{"mode",   required_argument, 0, 'M'},
+	{"modifier", required_argument, 0, 'm'},
+	{"video",  required_argument, 0, 'V'},
+	{0, 0, 0, 0}
 };
 
-static int init_drm(void)
+static void usage(const char *name)
 {
-	static const char *modules[] = {
-		        "i915", "amdgpu", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos", "msm", "tegra", "virtio_gpu"
-	};
-	drmModeRes *resources;
-	drmModeConnector *connector = NULL;
-	drmModeEncoder *encoder = NULL;
-	int i, area;
-
-	for (i = 0; i < ARRAY_SIZE(modules); i++) {
-		printf("trying to load module %s...", modules[i]);
-		drm.fd = drmOpen(modules[i], NULL);
-		if (drm.fd < 0) {
-			printf("failed.\n");
-		} else {
-			printf("success.\n");
-			break;
-		}
-	}
-
-	if (drm.fd < 0) {
-		printf("could not open drm device\n");
-		return -1;
-	}
-
-	resources = drmModeGetResources(drm.fd);
-	if (!resources) {
-		printf("drmModeGetResources failed: %s\n", strerror(errno));
-		return -1;
-	}
-
-	/* find a connected connector: */
-	for (i = 0; i < resources->count_connectors; i++) {
-		connector = drmModeGetConnector(drm.fd, resources->connectors[i]);
-		if (connector->connection == DRM_MODE_CONNECTED) {
-			/* it's connected, let's use this! */
-			break;
-		}
-		drmModeFreeConnector(connector);
-		connector = NULL;
-	}
-
-	if (!connector) {
-		/* we could be fancy and listen for hotplug events and wait for
-		 * a connector..
-		 */
-		printf("no connected connector!\n");
-		return -1;
-	}
-
-	/* find prefered mode or the highest resolution mode: */
-	for (i = 0, area = 0; i < connector->count_modes; i++) {
-		drmModeModeInfo *current_mode = &connector->modes[i];
-
-		if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
-			drm.mode = current_mode;
-		}
-
-		int current_area = current_mode->hdisplay * current_mode->vdisplay;
-		if (current_area > area) {
-			drm.mode = current_mode;
-			area = current_area;
-		}
-	}
-
-	if (!drm.mode) {
-		printf("could not find mode!\n");
-		return -1;
-	}
-
-	/* find encoder: */
-	for (i = 0; i < resources->count_encoders; i++) {
-		encoder = drmModeGetEncoder(drm.fd, resources->encoders[i]);
-		if (encoder->encoder_id == connector->encoder_id)
-			break;
-		drmModeFreeEncoder(encoder);
-		encoder = NULL;
-	}
-
-	if (!encoder) {
-		printf("no encoder!\n");
-		return -1;
-	}
-
-	drm.crtc_id = encoder->crtc_id;
-	drm.connector_id = connector->connector_id;
-
-	return 0;
-}
-
-static int init_gbm(void)
-{
-	gbm.dev = gbm_create_device(drm.fd);
-
-	gbm.surface = gbm_surface_create(gbm.dev,
-			drm.mode->hdisplay, drm.mode->vdisplay,
-			GBM_FORMAT_XRGB8888,
-			GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-	if (!gbm.surface) {
-		printf("failed to create gbm surface\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int init_gl(void)
-{
-	EGLint major, minor, n;
-	GLuint vertex_shader, fragment_shader;
-	GLint ret;
-
-	static const GLfloat vVertices[] = {
-			// front
-			-1.0f, -1.0f, +1.0f, // point blue
-			+1.0f, -1.0f, +1.0f, // point magenta
-			-1.0f, +1.0f, +1.0f, // point cyan
-			+1.0f, +1.0f, +1.0f, // point white
-			// back
-			+1.0f, -1.0f, -1.0f, // point red
-			-1.0f, -1.0f, -1.0f, // point black
-			+1.0f, +1.0f, -1.0f, // point yellow
-			-1.0f, +1.0f, -1.0f, // point green
-			// right
-			+1.0f, -1.0f, +1.0f, // point magenta
-			+1.0f, -1.0f, -1.0f, // point red
-			+1.0f, +1.0f, +1.0f, // point white
-			+1.0f, +1.0f, -1.0f, // point yellow
-			// left
-			-1.0f, -1.0f, -1.0f, // point black
-			-1.0f, -1.0f, +1.0f, // point blue
-			-1.0f, +1.0f, -1.0f, // point green
-			-1.0f, +1.0f, +1.0f, // point cyan
-			// top
-			-1.0f, +1.0f, +1.0f, // point cyan
-			+1.0f, +1.0f, +1.0f, // point white
-			-1.0f, +1.0f, -1.0f, // point green
-			+1.0f, +1.0f, -1.0f, // point yellow
-			// bottom
-			-1.0f, -1.0f, -1.0f, // point black
-			+1.0f, -1.0f, -1.0f, // point red
-			-1.0f, -1.0f, +1.0f, // point blue
-			+1.0f, -1.0f, +1.0f  // point magenta
-	};
-
-	static const GLfloat vColors[] = {
-			// front
-			0.0f,  0.0f,  1.0f, // blue
-			1.0f,  0.0f,  1.0f, // magenta
-			0.0f,  1.0f,  1.0f, // cyan
-			1.0f,  1.0f,  1.0f, // white
-			// back
-			1.0f,  0.0f,  0.0f, // red
-			0.0f,  0.0f,  0.0f, // black
-			1.0f,  1.0f,  0.0f, // yellow
-			0.0f,  1.0f,  0.0f, // green
-			// right
-			1.0f,  0.0f,  1.0f, // magenta
-			1.0f,  0.0f,  0.0f, // red
-			1.0f,  1.0f,  1.0f, // white
-			1.0f,  1.0f,  0.0f, // yellow
-			// left
-			0.0f,  0.0f,  0.0f, // black
-			0.0f,  0.0f,  1.0f, // blue
-			0.0f,  1.0f,  0.0f, // green
-			0.0f,  1.0f,  1.0f, // cyan
-			// top
-			0.0f,  1.0f,  1.0f, // cyan
-			1.0f,  1.0f,  1.0f, // white
-			0.0f,  1.0f,  0.0f, // green
-			1.0f,  1.0f,  0.0f, // yellow
-			// bottom
-			0.0f,  0.0f,  0.0f, // black
-			1.0f,  0.0f,  0.0f, // red
-			0.0f,  0.0f,  1.0f, // blue
-			1.0f,  0.0f,  1.0f  // magenta
-	};
-
-	static const GLfloat vNormals[] = {
-			// front
-			+0.0f, +0.0f, +1.0f, // forward
-			+0.0f, +0.0f, +1.0f, // forward
-			+0.0f, +0.0f, +1.0f, // forward
-			+0.0f, +0.0f, +1.0f, // forward
-			// back
-			+0.0f, +0.0f, -1.0f, // backbard
-			+0.0f, +0.0f, -1.0f, // backbard
-			+0.0f, +0.0f, -1.0f, // backbard
-			+0.0f, +0.0f, -1.0f, // backbard
-			// right
-			+1.0f, +0.0f, +0.0f, // right
-			+1.0f, +0.0f, +0.0f, // right
-			+1.0f, +0.0f, +0.0f, // right
-			+1.0f, +0.0f, +0.0f, // right
-			// left
-			-1.0f, +0.0f, +0.0f, // left
-			-1.0f, +0.0f, +0.0f, // left
-			-1.0f, +0.0f, +0.0f, // left
-			-1.0f, +0.0f, +0.0f, // left
-			// top
-			+0.0f, +1.0f, +0.0f, // up
-			+0.0f, +1.0f, +0.0f, // up
-			+0.0f, +1.0f, +0.0f, // up
-			+0.0f, +1.0f, +0.0f, // up
-			// bottom
-			+0.0f, -1.0f, +0.0f, // down
-			+0.0f, -1.0f, +0.0f, // down
-			+0.0f, -1.0f, +0.0f, // down
-			+0.0f, -1.0f, +0.0f  // down
-	};
-
-	static const EGLint context_attribs[] = {
-		EGL_CONTEXT_CLIENT_VERSION, 2,
-		EGL_NONE
-	};
-
-	static const EGLint config_attribs[] = {
-		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-		EGL_RED_SIZE, 1,
-		EGL_GREEN_SIZE, 1,
-		EGL_BLUE_SIZE, 1,
-		EGL_ALPHA_SIZE, 0,
-		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-		EGL_NONE
-	};
-
-	static const char *vertex_shader_source =
-			"uniform mat4 modelviewMatrix;      \n"
-			"uniform mat4 modelviewprojectionMatrix;\n"
-			"uniform mat3 normalMatrix;         \n"
-			"                                   \n"
-			"attribute vec4 in_position;        \n"
-			"attribute vec3 in_normal;          \n"
-			"attribute vec4 in_color;           \n"
+	printf("Usage: %s [-ADMmV]\n"
 			"\n"
-			"vec4 lightSource = vec4(2.0, 2.0, 20.0, 0.0);\n"
-			"                                   \n"
-			"varying vec4 vVaryingColor;        \n"
-			"                                   \n"
-			"void main()                        \n"
-			"{                                  \n"
-			"    gl_Position = modelviewprojectionMatrix * in_position;\n"
-			"    vec3 vEyeNormal = normalMatrix * in_normal;\n"
-			"    vec4 vPosition4 = modelviewMatrix * in_position;\n"
-			"    vec3 vPosition3 = vPosition4.xyz / vPosition4.w;\n"
-			"    vec3 vLightDir = normalize(lightSource.xyz - vPosition3);\n"
-			"    float diff = max(0.0, dot(vEyeNormal, vLightDir));\n"
-			"    vVaryingColor = vec4(diff * in_color.rgb, 1.0);\n"
-			"}                                  \n";
-
-	static const char *fragment_shader_source =
-			"precision mediump float;           \n"
-			"                                   \n"
-			"varying vec4 vVaryingColor;        \n"
-			"                                   \n"
-			"void main()                        \n"
-			"{                                  \n"
-			"    gl_FragColor = vVaryingColor;  \n"
-			"}                                  \n";
-
-	gl.display = eglGetDisplay(gbm.dev);
-
-	if (!eglInitialize(gl.display, &major, &minor)) {
-		printf("failed to initialize\n");
-		return -1;
-	}
-
-	printf("Using display %p with EGL version %d.%d\n",
-			gl.display, major, minor);
-
-	printf("EGL Version \"%s\"\n", eglQueryString(gl.display, EGL_VERSION));
-	printf("EGL Vendor \"%s\"\n", eglQueryString(gl.display, EGL_VENDOR));
-	printf("EGL Extensions \"%s\"\n", eglQueryString(gl.display, EGL_EXTENSIONS));
-
-	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-		printf("failed to bind api EGL_OPENGL_ES_API\n");
-		return -1;
-	}
-
-	if (!eglChooseConfig(gl.display, config_attribs, &gl.config, 1, &n) || n != 1) {
-		printf("failed to choose config: %d\n", n);
-		return -1;
-	}
-
-	gl.context = eglCreateContext(gl.display, gl.config,
-			EGL_NO_CONTEXT, context_attribs);
-	if (gl.context == NULL) {
-		printf("failed to create context\n");
-		return -1;
-	}
-
-	gl.surface = eglCreateWindowSurface(gl.display, gl.config, gbm.surface, NULL);
-	if (gl.surface == EGL_NO_SURFACE) {
-		printf("failed to create egl surface\n");
-		return -1;
-	}
-
-	/* connect the context to the surface */
-	eglMakeCurrent(gl.display, gl.surface, gl.surface, gl.context);
-
-
-	vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-
-	glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
-	glCompileShader(vertex_shader);
-
-	glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &ret);
-	if (!ret) {
-		char *log;
-
-		printf("vertex shader compilation failed!:\n");
-		glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &ret);
-		if (ret > 1) {
-			log = malloc(ret);
-			glGetShaderInfoLog(vertex_shader, ret, NULL, log);
-			printf("%s", log);
-		}
-
-		return -1;
-	}
-
-	fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-
-	glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
-	glCompileShader(fragment_shader);
-
-	glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &ret);
-	if (!ret) {
-		char *log;
-
-		printf("fragment shader compilation failed!:\n");
-		glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &ret);
-
-		if (ret > 1) {
-			log = malloc(ret);
-			glGetShaderInfoLog(fragment_shader, ret, NULL, log);
-			printf("%s", log);
-		}
-
-		return -1;
-	}
-
-	gl.program = glCreateProgram();
-
-	glAttachShader(gl.program, vertex_shader);
-	glAttachShader(gl.program, fragment_shader);
-
-	glBindAttribLocation(gl.program, 0, "in_position");
-	glBindAttribLocation(gl.program, 1, "in_normal");
-	glBindAttribLocation(gl.program, 2, "in_color");
-
-	glLinkProgram(gl.program);
-
-	glGetProgramiv(gl.program, GL_LINK_STATUS, &ret);
-	if (!ret) {
-		char *log;
-
-		printf("program linking failed!:\n");
-		glGetProgramiv(gl.program, GL_INFO_LOG_LENGTH, &ret);
-
-		if (ret > 1) {
-			log = malloc(ret);
-			glGetProgramInfoLog(gl.program, ret, NULL, log);
-			printf("%s", log);
-		}
-
-		return -1;
-	}
-
-	glUseProgram(gl.program);
-
-	gl.modelviewmatrix = glGetUniformLocation(gl.program, "modelviewMatrix");
-	gl.modelviewprojectionmatrix = glGetUniformLocation(gl.program, "modelviewprojectionMatrix");
-	gl.normalmatrix = glGetUniformLocation(gl.program, "normalMatrix");
-
-	glViewport(0, 0, drm.mode->hdisplay, drm.mode->vdisplay);
-	glEnable(GL_CULL_FACE);
-
-	gl.positionsoffset = 0;
-	gl.colorsoffset = sizeof(vVertices);
-	gl.normalsoffset = sizeof(vVertices) + sizeof(vColors);
-	glGenBuffers(1, &gl.vbo);
-	glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(vVertices) + sizeof(vColors) + sizeof(vNormals), 0, GL_STATIC_DRAW);
-	glBufferSubData(GL_ARRAY_BUFFER, gl.positionsoffset, sizeof(vVertices), &vVertices[0]);
-	glBufferSubData(GL_ARRAY_BUFFER, gl.colorsoffset, sizeof(vColors), &vColors[0]);
-	glBufferSubData(GL_ARRAY_BUFFER, gl.normalsoffset, sizeof(vNormals), &vNormals[0]);
-	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (const GLvoid*)gl.positionsoffset);
-	glEnableVertexAttribArray(0);
-	glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, (const GLvoid*)gl.normalsoffset);
-	glEnableVertexAttribArray(1);
-	glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, (const GLvoid*)gl.colorsoffset);
-	glEnableVertexAttribArray(2);
-
-	return 0;
-}
-
-static void draw(uint32_t i)
-{
-	PRINTF("draw(%d)\n", i);
-	ESMatrix modelview;
-
-	/* clear the color buffer */
-	glClearColor(0.5, 0.5, 0.5, 1.0);
-	glClear(GL_COLOR_BUFFER_BIT);
-
-	esMatrixLoadIdentity(&modelview);
-	esTranslate(&modelview, 0.0f, 0.0f, -8.0f);
-	esRotate(&modelview, 45.0f + (0.25f * i), 1.0f, 0.0f, 0.0f);
-	esRotate(&modelview, 45.0f - (0.5f * i), 0.0f, 1.0f, 0.0f);
-	esRotate(&modelview, 10.0f + (0.15f * i), 0.0f, 0.0f, 1.0f);
-
-	GLfloat aspect = (GLfloat)(drm.mode->vdisplay) / (GLfloat)(drm.mode->hdisplay);
-
-	ESMatrix projection;
-	esMatrixLoadIdentity(&projection);
-	esFrustum(&projection, -2.8f, +2.8f, -2.8f * aspect, +2.8f * aspect, 6.0f, 10.0f);
-
-	ESMatrix modelviewprojection;
-	esMatrixLoadIdentity(&modelviewprojection);
-	esMatrixMultiply(&modelviewprojection, &modelview, &projection);
-
-	float normal[9];
-	normal[0] = modelview.m[0][0];
-	normal[1] = modelview.m[0][1];
-	normal[2] = modelview.m[0][2];
-	normal[3] = modelview.m[1][0];
-	normal[4] = modelview.m[1][1];
-	normal[5] = modelview.m[1][2];
-	normal[6] = modelview.m[2][0];
-	normal[7] = modelview.m[2][1];
-	normal[8] = modelview.m[2][2];
-
-	glUniformMatrix4fv(gl.modelviewmatrix, 1, GL_FALSE, &modelview.m[0][0]);
-	glUniformMatrix4fv(gl.modelviewprojectionmatrix, 1, GL_FALSE, &modelviewprojection.m[0][0]);
-	glUniformMatrix3fv(gl.normalmatrix, 1, GL_FALSE, normal);
-
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	glDrawArrays(GL_TRIANGLE_STRIP, 4, 4);
-	glDrawArrays(GL_TRIANGLE_STRIP, 8, 4);
-	glDrawArrays(GL_TRIANGLE_STRIP, 12, 4);
-	glDrawArrays(GL_TRIANGLE_STRIP, 16, 4);
-	glDrawArrays(GL_TRIANGLE_STRIP, 20, 4);
-}
-
-static void
-drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
-{
-	struct drm_fb *fb = data;
-	struct gbm_device *gbm = gbm_bo_get_device(bo);
-
-	if (fb->fb_id)
-		drmModeRmFB(drm.fd, fb->fb_id);
-
-	free(fb);
-}
-
-static struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
-{
-	struct drm_fb *fb = gbm_bo_get_user_data(bo);
-	uint32_t width, height, stride, handle;
-	int ret;
-
-	if (fb)
-		return fb;
-
-	fb = calloc(1, sizeof *fb);
-	fb->bo = bo;
-
-	width = gbm_bo_get_width(bo);
-	height = gbm_bo_get_height(bo);
-	stride = gbm_bo_get_stride(bo);
-	handle = gbm_bo_get_handle(bo).u32;
-
-	ret = drmModeAddFB(drm.fd, width, height, 24, 32, stride, handle, &fb->fb_id);
-	if (ret) {
-		printf("failed to create fb: %s\n", strerror(errno));
-		free(fb);
-		return NULL;
-	}
-
-	gbm_bo_set_user_data(bo, fb, drm_fb_destroy_callback);
-
-	return fb;
-}
-
-static void page_flip_handler(int fd, unsigned int frame,
-		  unsigned int sec, unsigned int usec, void *data)
-{
-	PRINTF("page_flip_handler(fd=%d, frame=%d, sec=%d, usec=%d data=%p) ",
-	       fd, frame, sec, usec, data);
-	int *waiting_for_flip = data;
-	PRINTF("waiting_for_flip=%d\n", *waiting_for_flip);
-	*waiting_for_flip = 0;
-}
-
-static void
-kevent_init(struct kevent *ke, int *kqp)
-{
-	int kq;
-
-	kq = kqueue();
-
-	if (kq == -1) {
-		printf("kqueue() error\n");
-		exit(EXIT_FAILURE);
-	}
-	memset(ke, 0, sizeof(struct kevent));
-	EV_SET(ke, drm.fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 5, NULL);
-
-	if (kevent(kq, ke, 1, NULL, 0, NULL) == -1) {
-		printf("kevent() error\n");
-		exit(EXIT_FAILURE);
-	}
-	*kqp = kq;
+			"options:\n"
+			"    -A, --atomic             use atomic modesetting and fencing\n"
+			"    -D, --device=DEVICE      use the given device\n"
+			"    -M, --mode=MODE          specify mode, one of:\n"
+			"        smooth    -  smooth shaded cube (default)\n"
+			"        rgba      -  rgba textured cube\n"
+			"        nv12-2img -  yuv textured (color conversion in shader)\n"
+			"        nv12-1img -  yuv textured (single nv12 texture)\n"
+			"    -m, --modifier=MODIFIER  hardcode the selected modifier\n"
+			"    -V, --video=FILE         video textured cube\n",
+			name);
 }
 
 int main(int argc, char *argv[])
 {
-	fd_set fds;
-	drmEventContext evctx = {
-			.version = DRM_EVENT_CONTEXT_VERSION,
-			.page_flip_handler = page_flip_handler,
-	};
-	struct gbm_bo *bo;
-	struct drm_fb *fb;
-	uint32_t i = 0;
-	int ret;
+	const char *device = "/dev/dri/card0";
+	const char *video = NULL;
+	enum mode mode = SMOOTH;
+	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+	int atomic = 0;
+	int opt;
 
-	ret = init_drm();
-	if (ret) {
-		printf("failed to initialize DRM\n");
-		return ret;
-	}
+#ifdef HAVE_GST
+	gst_init(&argc, &argv);
+	GST_DEBUG_CATEGORY_INIT(kmscube_debug, "kmscube", 0, "kmscube video pipeline");
+#endif
 
-	struct kevent ke;
-	int kq, ch, use_kevent = 0;
-	while ((ch = getopt(argc, argv, "k")) != -1)  {
-		switch (ch) {
-		case 'k':
-			use_kevent =1;
+	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
+		switch (opt) {
+		case 'A':
+			atomic = 1;
 			break;
+		case 'D':
+			device = optarg;
+			break;
+		case 'M':
+			if (strcmp(optarg, "smooth") == 0) {
+				mode = SMOOTH;
+			} else if (strcmp(optarg, "rgba") == 0) {
+				mode = RGBA;
+			} else if (strcmp(optarg, "nv12-2img") == 0) {
+				mode = NV12_2IMG;
+			} else if (strcmp(optarg, "nv12-1img") == 0) {
+				mode = NV12_1IMG;
+			} else {
+				printf("invalid mode: %s\n", optarg);
+				usage(argv[0]);
+				return -1;
+			}
+			break;
+		case 'm':
+			modifier = strtoull(optarg, NULL, 0);
+			break;
+		case 'V':
+			mode = VIDEO;
+			video = optarg;
+			break;
+		default:
+			usage(argv[0]);
+			return -1;
 		}
 	}
-	if (use_kevent)
-		kevent_init(&ke, &kq);
-	FD_ZERO(&fds);
-	FD_SET(0, &fds);
-	FD_SET(drm.fd, &fds);
 
-	ret = init_gbm();
-	if (ret) {
-		printf("failed to initialize GBM\n");
-		return ret;
+	if (atomic)
+		drm = init_drm_atomic(device);
+	else
+		drm = init_drm_legacy(device);
+	if (!drm) {
+		printf("failed to initialize %s DRM\n", atomic ? "atomic" : "legacy");
+		return -1;
 	}
 
-	ret = init_gl();
-	if (ret) {
+	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay,
+			modifier);
+	if (!gbm) {
+		printf("failed to initialize GBM\n");
+		return -1;
+	}
+
+	if (mode == SMOOTH)
+		egl = init_cube_smooth(gbm);
+	else if (mode == VIDEO)
+		egl = init_cube_video(gbm, video);
+	else
+		egl = init_cube_tex(gbm, mode);
+
+	if (!egl) {
 		printf("failed to initialize EGL\n");
-		return ret;
+		return -1;
 	}
 
 	/* clear the color buffer */
 	glClearColor(0.5, 0.5, 0.5, 1.0);
 	glClear(GL_COLOR_BUFFER_BIT);
-	eglSwapBuffers(gl.display, gl.surface);
-	bo = gbm_surface_lock_front_buffer(gbm.surface);
-	fb = drm_fb_get_from_bo(bo);
 
-	/* set mode: */
-	ret = drmModeSetCrtc(drm.fd, drm.crtc_id, fb->fb_id, 0, 0,
-			&drm.connector_id, 1, drm.mode);
-	if (ret) {
-		printf("failed to set mode: %s\n", strerror(errno));
-		return ret;
-	}
-
-	while (1) {
-		struct gbm_bo *next_bo;
-		int waiting_for_flip = 1;
-
-		draw(i++);
-
-		eglSwapBuffers(gl.display, gl.surface);
-		next_bo = gbm_surface_lock_front_buffer(gbm.surface);
-		fb = drm_fb_get_from_bo(next_bo);
-
-		/*
-		 * Here you could also update drm plane layers if you want
-		 * hw composition
-		 */
-
-		ret = drmModePageFlip(drm.fd, drm.crtc_id, fb->fb_id,
-				DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-		if (ret) {
-			printf("failed to queue page flip: %s\n", strerror(errno));
-			return -1;
-		}
-
-		while (waiting_for_flip) {
-			PRINTF("%s: waiting for flip event on drm fd\n",__func__);
-
-			/* gettimeofday(&tv, NULL); */
-			/* printf("Called select/poll at time = %ld ms\n", tv.tv_usec/1000); */
-			if (use_kevent) {
-				memset(&ke, 0, sizeof(ke));
-				/* receive an event, a blocking call as timeout is NULL */
-				ret = kevent(kq, NULL, 0, &ke, 1, NULL);
-				if (ret == -1) {
-					printf("kevent() error\n");
-					exit(EXIT_FAILURE);
-				} else if (ret == 0)
-					printf("kevent() timeout...\n");
-
-				if (ke.ident != drm.fd) {
-					printf("ke.ident mismatch\n");
-					exit(EXIT_FAILURE);
-				}
-				drmHandleEvent(drm.fd, &evctx);
-				continue;
-			}
-			ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
-			if (ret < 0) {
-				printf("select err: %s\n", strerror(errno));
-				return ret;
-			} else if (ret == 0) {
-				printf("select timeout!\n");
-				return -1;
-			} else if (FD_ISSET(0, &fds)) {
-				printf("user interrupted!\n");
-				break;
-			}
-			drmHandleEvent(drm.fd, &evctx);
-		}
-
-		/* release last buffer to render on again: */
-		gbm_surface_release_buffer(gbm.surface, bo);
-		bo = next_bo;
-	}
-
-	return ret;
+	return drm->run(gbm, egl);
 }

@@ -23,22 +23,39 @@
 
 bin_PROGRAMS = kmscube
 
-kmscube_LDFLAGS = \
-	-no-undefined
-
 kmscube_LDADD = \
 	$(DRM_LIBS) \
 	$(GBM_LIBS) \
 	$(EGL_LIBS) \
-	$(GLES2_LIBS)
+	$(GLES2_LIBS) \
+	-lm
 
 kmscube_CFLAGS = \
-	-O0 -g -lm \
+	-O0 -g \
+	-Wall -Wextra \
+	-std=c99 \
 	$(DRM_CFLAGS) \
 	$(GBM_CFLAGS) \
 	$(EGL_CFLAGS) \
 	$(GLES2_CFLAGS)
 
 kmscube_SOURCES = \
-	kmscube.c \
-	esTransform.c
+	common.c \
+	common.h \
+	cube-smooth.c \
+	cube-tex.c \
+	drm-atomic.c \
+	drm-common.c \
+	drm-common.h \
+	drm-legacy.c \
+	esTransform.c \
+	esUtil.h \
+	frame-512x512-NV12.c \
+	frame-512x512-RGBA.c \
+	kmscube.c
+
+if ENABLE_GST
+kmscube_LDADD += $(GST_LIBS)
+kmscube_CFLAGS += $(GST_CFLAGS)
+kmscube_SOURCES += cube-video.c gst-decoder.c
+endif
