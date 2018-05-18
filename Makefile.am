@@ -59,3 +59,8 @@ kmscube_LDADD += $(GST_LIBS)
 kmscube_CFLAGS += $(GST_CFLAGS)
 kmscube_SOURCES += cube-video.c gst-decoder.c
 endif
+
+if USE_KQUEUE
+kmscube_SOURCES += drm-kqueue.c
+kmscube_CPPFLAGS = -DUSE_KQUEUE
+endif
