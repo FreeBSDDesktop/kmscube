@@ -43,10 +43,11 @@ static const struct egl *egl;
 static const struct gbm *gbm;
 static const struct drm *drm;
 
-static const char *shortopts = "AD:M:m:V:";
+static const char *shortopts = "AKD:M:m:V:";
 
 static const struct option longopts[] = {
 	{"atomic", no_argument,       0, 'A'},
+	{"kqueue", no_argument,       0, 'K'},
 	{"device", required_argument, 0, 'D'},
 	{"mode",   required_argument, 0, 'M'},
 	{"modifier", required_argument, 0, 'm'},
@@ -56,10 +57,11 @@ static const struct option longopts[] = {
 
 static void usage(const char *name)
 {
-	printf("Usage: %s [-ADMmV]\n"
+	printf("Usage: %s [-AKDMmV]\n"
 			"\n"
 			"options:\n"
 			"    -A, --atomic             use atomic modesetting and fencing\n"
+			"    -K, --kqueue             use kqueue (if available)\n"
 			"    -D, --device=DEVICE      use the given device\n"
 			"    -M, --mode=MODE          specify mode, one of:\n"
 			"        smooth    -  smooth shaded cube (default)\n"
@@ -78,6 +80,7 @@ int main(int argc, char *argv[])
 	enum mode mode = SMOOTH;
 	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	int atomic = 0;
+	int kqueue = 0;
 	int opt;
 
 #ifdef HAVE_GST
@@ -89,6 +92,9 @@ int main(int argc, char *argv[])
 		switch (opt) {
 		case 'A':
 			atomic = 1;
+			break;
+		case 'K':
+			kqueue = 1;
 			break;
 		case 'D':
 			device = optarg;
@@ -123,7 +129,14 @@ int main(int argc, char *argv[])
 
 	if (atomic)
 		drm = init_drm_atomic(device);
-	else
+	else if (kqueue) {
+#ifdef USE_KQUEUE
+		drm = init_drm_kqueue(device);
+#else
+		printf("kqueue not available, using legacy\n");
+		drm = init_drm_legacy(device);
+#endif
+	} else
 		drm = init_drm_legacy(device);
 	if (!drm) {
 		printf("failed to initialize %s DRM\n", atomic ? "atomic" : "legacy");

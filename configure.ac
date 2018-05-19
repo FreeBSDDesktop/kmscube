@@ -65,5 +65,26 @@ if test "x$enable_gbm_modifiers" = xyes; then
 	AC_DEFINE(HAVE_GBM_MODIFIERS, 1, [Define if you can use GBM properties.])
 fi
 
+
+# Check for kqueue: if the sys/event.h header is present, perform a check for
+# the kqueue and kevent functions.
+AC_CHECK_HEADERS([sys/event.h])
+AS_VAR_IF([ac_cv_header_sys_event_h], ["yes"], [
+	AS_VAR_SET([KQUEUE_AVAILABLE], ["yes"])
+	AC_CHECK_DECLS(
+		[kqueue, kevent],
+		[],
+		[AS_VAR_SET([KQUEUE_AVAILABLE], ["no"])],
+		[
+			AC_INCLUDES_DEFAULT
+			[#include <sys/event.h>]
+			[#include <sys/types.h>]
+			[#include <sys/time.h>]
+		]
+	)
+	AC_CHECK_LIB([c], [kqueue], [], [AS_VAR_SET([KQUEUE_AVAILABLE], ["no"])])
+])
+AM_CONDITIONAL([USE_KQUEUE], [test "x${KQUEUE_AVAILABLE}" = "xyes"])
+
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
